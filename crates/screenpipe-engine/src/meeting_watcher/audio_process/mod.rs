@@ -445,6 +445,7 @@ pub async fn run_audio_process_meeting_detection_loop(
                 AudioProcessStateAction::EndMeeting {
                     meeting_id,
                     suppressed_session,
+                    ..
                 } => {
                     last_ended_room = Some(EndedRoom {
                         meeting_id: *meeting_id,
@@ -575,6 +576,22 @@ pub async fn run_audio_process_meeting_detection_loop(
                     has_live_candidates,
                 },
             );
+            // A revive means the call came back during the ending grace. If the
+            // close had already failed once, its live session was detached, so
+            // ask the streaming coordinator to pick this meeting back up.
+            // Reattach is idempotent — it is ignored when that meeting is
+            // already streaming — so the ordinary flap revive costs nothing.
+            if edge.transition == "ending_to_active" {
+                if let Err(error) = screenpipe_events::send_event(
+                    screenpipe_audio::meeting_streaming::MEETING_STREAMING_REATTACH_EVENT,
+                    serde_json::json!({ "meeting_id": edge.meeting_id }),
+                ) {
+                    warn!(
+                        "audio-process meeting detector: failed to request live reattach for meeting {}: {}",
+                        edge.meeting_id, error
+                    );
+                }
+            }
         }
         interval = if processes.is_empty() {
             IDLE_POLL_INTERVAL

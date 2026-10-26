@@ -34,6 +34,19 @@ use super::{
 /// because recording bounced mid-meeting.
 pub const MEETING_STREAMING_REATTACH_EVENT: &str = "meeting_streaming_reattach";
 
+/// Stop the live session for a meeting whose sensor-confirmed end could not be
+/// persisted yet.
+///
+/// Distinct from `meeting_ended` on purpose. `meeting_ended` is the durable
+/// finalization signal — summaries, suggestions, speaker id and detection
+/// telemetry all hang off it — so it must stay tied to a committed
+/// `meeting_end`. When the close write is blocked (a jammed writer permit
+/// surfaces as `PoolTimedOut`), the row stays active while the sensor has
+/// already confirmed the call is over. Transcription must not keep running
+/// under that meeting in the meantime, so the detector detaches the live
+/// session immediately and retries the durable close separately.
+pub const MEETING_STREAMING_DETACH_EVENT: &str = "meeting_streaming_detach";
+
 const LIVE_FINAL_PERSIST_ATTEMPTS: usize = 18;
 const LIVE_FINAL_PERSIST_RETRY_DELAY: Duration = Duration::from_secs(5);
 const PROVIDER_STREAM_RESTART_BACKOFF: Duration = Duration::from_secs(5);
@@ -143,6 +156,9 @@ pub fn start_meeting_streaming_loop(
         let mut reattach_sub = screenpipe_events::subscribe_to_event::<MeetingLifecycleEvent>(
             MEETING_STREAMING_REATTACH_EVENT,
         );
+        let mut detach_sub = screenpipe_events::subscribe_to_event::<MeetingLifecycleEvent>(
+            MEETING_STREAMING_DETACH_EVENT,
+        );
         let mut inactivity_tick = tokio::time::interval(LIVE_INACTIVITY_CHECK_INTERVAL);
         let mut active: Option<ActiveMeetingStream> = None;
 
@@ -250,34 +266,18 @@ pub fn start_meeting_streaming_loop(
                         warn!("meeting streaming: ignoring meeting_ended without meeting_id");
                         continue;
                     };
-
-                    match active.take() {
-                        Some(session) if session.meeting_id == meeting_id => {
-                            let provider = session.provider.clone();
-                            let live = session.live_transcription_enabled;
-                            let live_covered = session.live_transcript_seen;
-                            emit_session_ended(session);
-                            audio_tap.set_active(false);
-                            audio_tap.set_background_suppressed(false);
-                            if live_covered {
-                                mark_live_covered_chunks(&db, meeting_id).await;
-                            }
-                            emit_status(false, None, &provider, live, None);
-                        }
-                        Some(session) => {
-                            debug!(
-                                "meeting streaming: end for meeting {} while {} is active; keeping active session",
-                                meeting_id,
-                                session.meeting_id
-                            );
-                            active = Some(session);
-                        }
-                        None => {
-                            debug!("meeting streaming: end for inactive meeting {}", meeting_id);
-                            audio_tap.set_active(false);
-                            audio_tap.set_background_suppressed(false);
-                        }
-                    }
+                    stop_live_session(&mut active, &audio_tap, &db, meeting_id, "end").await;
+                }
+                Some(event) = detach_sub.next() => {
+                    let Some(meeting_id) = event.data.resolved_meeting_id() else {
+                        warn!("meeting streaming: ignoring detach without meeting_id");
+                        continue;
+                    };
+                    info!(
+                        "meeting streaming: detaching live session for meeting {} (sensor-confirmed end, durable close still pending)",
+                        meeting_id
+                    );
+                    stop_live_session(&mut active, &audio_tap, &db, meeting_id, "detach").await;
                 }
                 Some(event) = final_sub.next() => {
                     if let Some(session) = active.as_mut() {
@@ -650,6 +650,53 @@ async fn persist_live_final_once(
     }
 
     Ok(true)
+}
+
+/// Tear down the live session for `meeting_id`, if that is the one streaming.
+///
+/// Shared by `meeting_ended` (durable close committed) and
+/// [`MEETING_STREAMING_DETACH_EVENT`] (sensor-confirmed end whose close write
+/// is still pending), so a blocked write stops transcription through exactly
+/// the same path a committed one does. Taking the session first makes it
+/// idempotent: the `meeting_ended` that follows a successful close retry finds
+/// nothing active and only re-asserts the tap, so the session-ended event and
+/// the live-coverage marking each happen once.
+async fn stop_live_session(
+    active: &mut Option<ActiveMeetingStream>,
+    audio_tap: &MeetingAudioTap,
+    db: &Arc<DatabaseManager>,
+    meeting_id: i64,
+    reason: &str,
+) {
+    match active.take() {
+        Some(session) if session.meeting_id == meeting_id => {
+            let provider = session.provider.clone();
+            let live = session.live_transcription_enabled;
+            let live_covered = session.live_transcript_seen;
+            emit_session_ended(session);
+            audio_tap.set_active(false);
+            audio_tap.set_background_suppressed(false);
+            if live_covered {
+                mark_live_covered_chunks(db, meeting_id).await;
+            }
+            emit_status(false, None, &provider, live, None);
+        }
+        Some(session) => {
+            debug!(
+                "meeting streaming: {} for meeting {} while {} is active; keeping active session",
+                reason, meeting_id, session.meeting_id
+            );
+            *active = Some(session);
+        }
+        None => {
+            debug!(
+                "meeting streaming: {} for inactive meeting {}",
+                reason, meeting_id
+            );
+            audio_tap.set_active(false);
+            audio_tap.set_background_suppressed(false);
+        }
+    }
 }
 
 fn emit_session_ended(session: ActiveMeetingStream) {
@@ -1689,5 +1736,86 @@ mod tests {
             effective.model.as_deref(),
             Some("selected transcription engine")
         );
+    }
+
+    /// A session the coordinator would be holding mid-meeting.
+    ///
+    /// `live_transcript_seen: false` keeps `stop_live_session` off the
+    /// live-coverage write, which is not what these tests are about.
+    fn streaming_session(meeting_id: i64) -> ActiveMeetingStream {
+        ActiveMeetingStream {
+            meeting_id,
+            provider: "fixture".into(),
+            config: MeetingStreamingConfig::default(),
+            live_transcription_enabled: true,
+            started_at: Instant::now(),
+            audio_frames_seen: 0,
+            audio_samples_seen: 0,
+            last_audio_activity_at: Instant::now(),
+            last_voiced_audio_at: None,
+            live_transcript_seen: false,
+            last_live_transcript_at: None,
+            notified_audio_stall: false,
+            notified_transcript_stall: false,
+            capture_invalidation_watermark: crate::stream_invalidation::generation(),
+            capture_disruption_rebases: 0,
+            device_senders: HashMap::new(),
+            device_retry_after: HashMap::new(),
+        }
+    }
+
+    fn live_tap() -> MeetingAudioTap {
+        let (tx, _rx) = broadcast::channel(8);
+        let tap = MeetingAudioTap::new(tx, Arc::new(std::sync::atomic::AtomicBool::new(true)));
+        tap.set_background_suppressed(true);
+        tap
+    }
+
+    /// screenpipe/screenpipe#7705: a blocked close detaches the live session,
+    /// and the `meeting_ended` that follows the successful retry must not tear
+    /// the same session down twice.
+    #[tokio::test]
+    async fn detach_stops_the_live_session_and_a_later_end_is_a_no_op() {
+        let db = Arc::new(
+            DatabaseManager::new("sqlite::memory:", Default::default())
+                .await
+                .unwrap(),
+        );
+        let tap = live_tap();
+        let mut active = Some(streaming_session(7));
+
+        // The detector could not persist the close, so it detaches.
+        stop_live_session(&mut active, &tap, &db, 7, "detach").await;
+        assert!(active.is_none(), "detach must stop the live session");
+        assert!(
+            !tap.is_active(),
+            "transcription must stop feeding the provider"
+        );
+
+        // The retry commits and `meeting_ended` arrives for the same meeting.
+        stop_live_session(&mut active, &tap, &db, 7, "end").await;
+        assert!(active.is_none());
+        assert!(!tap.is_active());
+    }
+
+    #[tokio::test]
+    async fn detach_for_a_different_meeting_keeps_the_active_session() {
+        let db = Arc::new(
+            DatabaseManager::new("sqlite::memory:", Default::default())
+                .await
+                .unwrap(),
+        );
+        let tap = live_tap();
+        let mut active = Some(streaming_session(7));
+
+        // A stale close for an older meeting must not interrupt the live one.
+        stop_live_session(&mut active, &tap, &db, 99, "detach").await;
+
+        assert_eq!(
+            active.as_ref().map(|session| session.meeting_id),
+            Some(7),
+            "an unrelated detach must leave the streaming session alone"
+        );
+        assert!(tap.is_active(), "and must not cut live audio");
     }
 }

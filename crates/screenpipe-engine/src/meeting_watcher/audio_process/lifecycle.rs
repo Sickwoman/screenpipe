@@ -312,6 +312,26 @@ pub(crate) async fn insert_new_audio_process_meeting(
     }
 }
 
+/// Stop the live streaming session for a meeting whose close has not persisted.
+///
+/// Deliberately not `meeting_ended`. That event is the durable finalization
+/// signal — summaries, suggestions, speaker id and detection telemetry all hang
+/// off it — so emitting it for an unpersisted close would finalize a meeting
+/// whose row is still active, and finalize it again when the retry commits.
+/// This carries no timestamp for the same reason: it is a live-session stop,
+/// not an end-of-meeting fact.
+fn detach_live_session(meeting_id: i64) {
+    if let Err(e) = screenpipe_events::send_event(
+        screenpipe_audio::meeting_streaming::MEETING_STREAMING_DETACH_EVENT,
+        serde_json::json!({ "meeting_id": meeting_id }),
+    ) {
+        warn!(
+            "audio-process meeting detector: failed to detach live session for meeting {}: {}",
+            meeting_id, e
+        );
+    }
+}
+
 pub(crate) async fn emit_ended_and_status(
     db: &DatabaseManager,
     manual_meeting: &tokio::sync::RwLock<Option<i64>>,
@@ -547,13 +567,20 @@ pub(crate) async fn apply_state_action(
         AudioProcessStateAction::EndMeeting {
             meeting_id,
             suppressed_session,
+            pending,
         } => {
             if let Some(session) = suppressed_session {
                 suppress_session(suppressed_sessions, session);
             }
-            let now_ts = action_now_utc.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
+            // Derived from the preserved observation rather than this tick, so
+            // a retry proposes the same boundary. Whichever attempt commits
+            // first owns the value: `end_meeting_with_typed_text` reads the
+            // stored `meeting_end` back, so every event carries that one.
+            let end_ts = episode_start_utc(pending.ended_at, now, action_now_utc)
+                .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+                .to_string();
             match db
-                .end_meeting_with_typed_text(meeting_id, &now_ts, true, None)
+                .end_meeting_with_typed_text(meeting_id, &end_ts, true, None)
                 .await
             {
                 Ok(persisted_end) => {
@@ -563,9 +590,34 @@ pub(crate) async fn apply_state_action(
                 }
                 Err(e) => {
                     error!(
-                        "audio-process meeting detector: failed to end meeting {}: {}",
+                        "audio-process meeting detector: failed to end meeting {}: {}; detaching live session, close stays pending",
                         meeting_id, e
                     );
+                    // Two separable obligations, and only one of them can wait
+                    // for the database.
+                    //
+                    // The sensor has already confirmed the call is over, so the
+                    // live session must stop now: leaving it attached is what
+                    // kept the overlay showing "meeting live" and streaming
+                    // transcription into a finished meeting until an explicit
+                    // stop (screenpipe/screenpipe#7705). Detach is a separate
+                    // event from `meeting_ended` precisely so this does not
+                    // finalize anything.
+                    detach_live_session(meeting_id);
+                    // Durable finalization stays tied to persistence. Restoring
+                    // `Ending` with the original instants means the next tick
+                    // re-issues this same action, and `since` is already past
+                    // the grace so that happens immediately. A rejoin in the
+                    // meantime still revives through `matching_session_key`.
+                    *state = AudioProcessMeetingState::Ending {
+                        meeting_id,
+                        platform: pending.platform,
+                        session_key: pending.session_key,
+                        meeting_url: pending.meeting_url,
+                        first_seen_at: pending.first_seen_at,
+                        since: pending.since,
+                        is_browser: pending.is_browser,
+                    };
                 }
             }
             sync_meeting_flag(false, None, in_meeting_flag, detector);

@@ -42,6 +42,34 @@ pub(crate) enum AudioProcessMeetingState {
     },
 }
 
+/// What a close needs in order to survive a transient persistence failure.
+///
+/// `advance_from_ending` decides a meeting is over from sensor state alone, so
+/// the decision outlives any one write attempt. Carrying the original instants
+/// lets the handler put the state machine back into `Ending` and propose the
+/// very same `meeting_end` next tick, rather than dropping to `Idle` with the
+/// row still active (screenpipe/screenpipe#7705).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PendingClose {
+    /// Everything `Ending` needs is carried here rather than recovered from
+    /// `suppressed_session`, whose `platform` is optional: a restored state
+    /// with an empty platform would stop `matching_session_key` from reviving
+    /// a rejoin during the retry window.
+    pub platform: String,
+    pub session_key: ProcessKey,
+    pub meeting_url: Option<String>,
+    /// Original episode start, so a restored `Ending` keeps the real duration.
+    pub first_seen_at: Instant,
+    /// When the session was last seen. Restored as `Ending::since`, which is
+    /// already past the grace, so the next tick retries immediately.
+    pub since: Instant,
+    /// The instant the close became due, as `since + ending_grace`. Derived
+    /// purely from preserved state, so every retry maps to the same UTC
+    /// `meeting_end` and the stored boundary cannot drift between attempts.
+    pub ended_at: Instant,
+    pub is_browser: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AudioProcessStateAction {
     StartMeeting {
@@ -56,6 +84,10 @@ pub(crate) enum AudioProcessStateAction {
     EndMeeting {
         meeting_id: i64,
         suppressed_session: Option<SuppressedSession>,
+        /// Close context retained so a failed persistence attempt can restore
+        /// `Ending` and retry the identical boundary instead of abandoning the
+        /// row in `Idle` — the same contract `RoomChanged` already honours.
+        pending: PendingClose,
     },
     /// The live meeting's app moved to a different call: end the current row
     /// (`end_reason = room_changed`) and start a fresh one for the session the
@@ -497,6 +529,19 @@ fn advance_from_ending(
             AudioProcessMeetingState::Idle,
             Some(AudioProcessStateAction::EndMeeting {
                 meeting_id,
+                pending: PendingClose {
+                    platform: platform.clone(),
+                    session_key: session_key.clone(),
+                    meeting_url: meeting_url.clone(),
+                    first_seen_at,
+                    since,
+                    // Anchored to the sensor observation plus the grace, not to
+                    // this tick: the poll interval would otherwise put the
+                    // boundary wherever the loop happened to wake, and a retry
+                    // would move it again.
+                    ended_at: since + ending_grace,
+                    is_browser,
+                },
                 suppressed_session: Some(SuppressedSession {
                     session_key,
                     platform: Some(platform),

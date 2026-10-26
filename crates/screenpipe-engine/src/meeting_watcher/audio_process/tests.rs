@@ -2217,6 +2217,7 @@ fn end_after_mic_switch_rekey_suppresses_adopted_session_key() {
     let Some(AudioProcessStateAction::EndMeeting {
         meeting_id: 67,
         suppressed_session: Some(suppressed),
+        ..
     }) = action
     else {
         panic!("expected EndMeeting with a suppressed session, got {action:?}");
@@ -4966,4 +4967,451 @@ async fn pipeline_suppressed_old_room_on_the_live_session_keeps_the_new_meeting(
         .unwrap()
         .meeting_end
         .is_none());
+}
+
+// ---------------------------------------------------------------------------
+// Close-timeout recovery (screenpipe/screenpipe#7705).
+//
+// `advance_from_ending` decides a meeting is over from sensor state, before any
+// write is attempted. When the close write then fails — a jammed writer lane
+// surfaces as `PoolTimedOut` after the 10s wait in
+// `begin_immediate_with_retry` — the old handler logged the error and dropped
+// to `Idle`. The row stayed active, no `meeting_ended` was emitted, and the
+// streaming coordinator kept transcribing under the finished meeting until an
+// explicit stop.
+// ---------------------------------------------------------------------------
+
+/// Whether an event naming `meeting_id` arrives within `window`.
+///
+/// The event bus is a process-wide singleton and other tests in this binary
+/// emit `meeting_ended` too, so matching on the id is what keeps this assertion
+/// about *this* meeting rather than whatever else the suite is doing.
+async fn saw_event_for_meeting(
+    sub: &mut screenpipe_events::EventSubscription<serde_json::Value>,
+    meeting_id: i64,
+    window: Duration,
+) -> bool {
+    use futures::StreamExt as _;
+    let deadline = Instant::now() + window;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        match tokio::time::timeout(remaining, sub.next()).await {
+            Ok(Some(event)) => {
+                let seen = event.data["meeting_id"]
+                    .as_i64()
+                    .or_else(|| event.data["id"].as_i64());
+                if seen == Some(meeting_id) {
+                    return true;
+                }
+            }
+            Ok(None) | Err(_) => return false,
+        }
+    }
+}
+
+/// The close context a blocked attempt must preserve for its retry.
+fn pending_close_fixture(key: &ProcessKey, first_seen_at: Instant, since: Instant) -> PendingClose {
+    PendingClose {
+        platform: "Google Meet".to_string(),
+        session_key: key.clone(),
+        meeting_url: Some("https://meet.google.com/abc-defg-hij".to_string()),
+        first_seen_at,
+        since,
+        ended_at: since + ENDING_GRACE,
+        is_browser: true,
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(meeting_events)]
+async fn blocked_close_detaches_live_session_then_retries_with_the_original_boundary() {
+    let (_dir, db) = setup_db().await;
+    let process = chrome_process();
+    let key = ProcessKey::from_process(&process).unwrap();
+    let manual_meeting = tokio::sync::RwLock::new(None);
+    let mut state = AudioProcessMeetingState::Idle;
+    let mut suppressed = Vec::new();
+    let mut flap_count = 0;
+    let in_meeting = AtomicBool::new(true);
+
+    // Move this test's meeting into its own id range. The event bus is a
+    // process-wide singleton while each test gets a fresh database, so ids
+    // restart at 1 everywhere and another test's `meeting_ended` for meeting 1
+    // would otherwise be indistinguishable from this one's. A long-ended row
+    // under a private app name bumps `sqlite_sequence` without being active or
+    // reopenable.
+    db.execute_raw_sql_write(
+        "INSERT INTO meetings (id, meeting_start, meeting_end, meeting_app) VALUES (900000, '2020-01-01T00:00:00+00:00', '2020-01-01T00:10:00+00:00', 'id-space-sentinel')",
+    )
+    .await
+    .unwrap();
+
+    let now = Instant::now();
+    let now_utc = Utc::now();
+    let started_at = now - Duration::from_secs(30 * 60);
+
+    apply_state_action(
+        AudioProcessStateAction::StartMeeting {
+            platform: "Google Meet".to_string(),
+            session_key: key.clone(),
+            meeting_url: Some("https://meet.google.com/abc-defg-hij".to_string()),
+            first_seen_at: started_at,
+            is_browser: true,
+            pid: process.pid,
+            bundle_id: process.bundle_id.clone(),
+        },
+        &db,
+        &manual_meeting,
+        &mut state,
+        &mut suppressed,
+        &mut flap_count,
+        &in_meeting,
+        &None,
+        None,
+        None,
+        &[],
+        started_at,
+        now_utc - chrono::Duration::minutes(30),
+    )
+    .await;
+    let meeting_id = match &state {
+        AudioProcessMeetingState::Active { meeting_id, .. } => *meeting_id,
+        other => panic!("expected an active meeting to close, got {other:?}"),
+    };
+
+    // The sensor last saw the session a full grace ago, so the close is due.
+    let since = now - ENDING_GRACE;
+    let pending = pending_close_fixture(&key, started_at, since);
+    // The boundary whichever attempt commits must store. It is derived from the
+    // observation, so the first attempt and the retry agree on it.
+    let expected_end = episode_start_utc(pending.ended_at, now, now_utc);
+
+    let mut detach_sub = screenpipe_events::subscribe_to_event::<serde_json::Value>(
+        screenpipe_audio::meeting_streaming::MEETING_STREAMING_DETACH_EVENT,
+    );
+    let mut ended_sub = screenpipe_events::subscribe_to_event::<serde_json::Value>("meeting_ended");
+
+    // Jam the single writer lane. This is the same semaphore
+    // `begin_immediate_with_retry` waits on, so the close gets a real
+    // `PoolTimedOut` after its 10s budget rather than an injected error.
+    let blocker = db.coordinated_writer().lock().await.unwrap();
+
+    apply_state_action(
+        AudioProcessStateAction::EndMeeting {
+            meeting_id,
+            suppressed_session: Some(SuppressedSession {
+                session_key: key.clone(),
+                platform: Some("Google Meet".to_string()),
+                meeting_url: pending.meeting_url.clone(),
+            }),
+            pending: pending.clone(),
+        },
+        &db,
+        &manual_meeting,
+        &mut state,
+        &mut suppressed,
+        &mut flap_count,
+        &in_meeting,
+        &None,
+        None,
+        None,
+        &[],
+        now,
+        now_utc,
+    )
+    .await;
+
+    // 1. The close stays pending with its original observation, instead of
+    //    being abandoned in `Idle` with the row still active.
+    match &state {
+        AudioProcessMeetingState::Ending {
+            meeting_id: still_closing,
+            since: kept_since,
+            first_seen_at: kept_start,
+            platform,
+            ..
+        } => {
+            assert_eq!(*still_closing, meeting_id);
+            assert_eq!(*kept_since, since, "the retry must keep the observation");
+            assert_eq!(*kept_start, started_at, "the episode start must survive");
+            assert_eq!(
+                platform, "Google Meet",
+                "an empty platform here would stop a rejoin reviving"
+            );
+        }
+        other => panic!("a blocked close must remain pending, got {other:?}"),
+    }
+    assert!(
+        db.get_meeting_by_id(meeting_id)
+            .await
+            .unwrap()
+            .meeting_end
+            .is_none(),
+        "the row cannot be ended while its write is blocked"
+    );
+
+    // 2. The live session is torn down regardless. Transcription continuing
+    //    under a finished meeting is the reported symptom.
+    assert!(
+        saw_event_for_meeting(&mut detach_sub, meeting_id, Duration::from_secs(2)).await,
+        "a blocked close must still detach the live session"
+    );
+
+    // 3. Nothing is finalized while the row is still open.
+    assert!(
+        !saw_event_for_meeting(&mut ended_sub, meeting_id, Duration::from_millis(300)).await,
+        "meeting_ended must stay tied to successful persistence"
+    );
+
+    // Contention clears.
+    drop(blocker);
+
+    // The restored state is already past the grace, so the next tick re-issues
+    // the same close instead of waiting another full grace.
+    let retry_at = now + Duration::from_secs(1);
+    let retry_utc = now_utc + chrono::Duration::seconds(1);
+    let (next_state, action) = advance_audio_process_state(
+        state,
+        &[],
+        &[],
+        retry_at,
+        CANDIDATE_CONFIRM_WINDOW,
+        ENDING_GRACE,
+    );
+    state = next_state;
+    let action = action.expect("a restored pending close must re-issue EndMeeting");
+    apply_state_action(
+        action,
+        &db,
+        &manual_meeting,
+        &mut state,
+        &mut suppressed,
+        &mut flap_count,
+        &in_meeting,
+        &None,
+        None,
+        None,
+        &[],
+        retry_at,
+        retry_utc,
+    )
+    .await;
+
+    // 4. Eventual closure, at the boundary observed before the first attempt
+    //    rather than wherever the write finally landed.
+    let stored_end = db
+        .get_meeting_by_id(meeting_id)
+        .await
+        .unwrap()
+        .meeting_end
+        .expect("the retry must close the row once the writer frees up");
+    // Compare instants, not spellings: the database normalises the offset it
+    // stores, so a string compare would pass or fail on formatting.
+    assert_eq!(
+        chrono::DateTime::parse_from_rfc3339(&stored_end)
+            .unwrap()
+            .timestamp_millis(),
+        expected_end.timestamp_millis(),
+        "the retry must not move the end to the time the write succeeded"
+    );
+    assert!(matches!(state, AudioProcessMeetingState::Idle));
+
+    // 5. Exactly one finalization, from the attempt that committed.
+    assert!(
+        saw_event_for_meeting(&mut ended_sub, meeting_id, Duration::from_secs(2)).await,
+        "the committed close must finalize"
+    );
+    assert!(
+        !saw_event_for_meeting(&mut ended_sub, meeting_id, Duration::from_millis(300)).await,
+        "the failed attempt must not finalize this meeting a second time"
+    );
+
+    // 6. No stale active row is left to block the next meeting's auto-start.
+    assert!(
+        db.get_most_recent_active_meeting().await.unwrap().is_none(),
+        "a stale active row would block the next meeting from starting"
+    );
+}
+
+#[test]
+fn rejoin_during_a_pending_close_revives_the_same_meeting() {
+    let process = chrome_process();
+    let key = ProcessKey::from_process(&process).unwrap();
+    let start = Instant::now();
+
+    // Exactly the state a blocked close now leaves behind.
+    let pending = AudioProcessMeetingState::Ending {
+        meeting_id: 77,
+        platform: "Google Meet".to_string(),
+        session_key: key.clone(),
+        meeting_url: Some("https://meet.google.com/abc-defg-hij".to_string()),
+        first_seen_at: start,
+        since: start,
+        is_browser: true,
+    };
+    let candidate = ResolvedMeetingCandidate::Browser {
+        platform: "Google Meet".to_string(),
+        meeting_url: "https://meet.google.com/abc-defg-hij".to_string(),
+        browser_app: "Google Chrome".to_string(),
+        session_key: key.clone(),
+        first_seen_at: start,
+        process,
+        live_evidence: true,
+    };
+
+    // Well past the grace, so without a candidate this would close.
+    let (revived, action) = advance_audio_process_state(
+        pending,
+        &[candidate.clone()],
+        &[candidate],
+        start + Duration::from_secs(25),
+        CANDIDATE_CONFIRM_WINDOW,
+        ENDING_GRACE,
+    );
+
+    match revived {
+        AudioProcessMeetingState::Active { meeting_id, .. } => assert_eq!(
+            meeting_id, 77,
+            "the rejoin must revive the pending row, not mint a second one"
+        ),
+        other => panic!("a rejoin during a pending close must revive, got {other:?}"),
+    }
+    assert!(
+        action.is_none(),
+        "reviving must not re-issue a close that is no longer wanted"
+    );
+}
+
+#[test]
+fn revive_publishes_the_edge_that_reattaches_a_detached_live_session() {
+    let process = chrome_process();
+    let key = ProcessKey::from_process(&process).unwrap();
+    let start = Instant::now();
+    // A failed close detaches the live session, so the detector has to ask the
+    // streaming coordinator to pick the meeting back up when it revives. That
+    // request rides this transition edge.
+    let edge = active_ending_transition(
+        false,
+        true,
+        &AudioProcessMeetingState::Active {
+            meeting_id: 77,
+            platform: "Google Meet".to_string(),
+            session_key: key,
+            meeting_url: None,
+            first_seen_at: start,
+            last_seen_at: start,
+            is_browser: true,
+        },
+    )
+    .expect("a revive must be classified");
+    assert_eq!(edge.transition, "ending_to_active");
+    assert_eq!(edge.meeting_id, 77);
+}
+
+#[tokio::test]
+#[serial_test::serial(meeting_events)]
+async fn manual_stop_racing_a_retry_keeps_the_manual_boundary() {
+    let (_dir, db) = setup_db().await;
+    let process = chrome_process();
+    let key = ProcessKey::from_process(&process).unwrap();
+    let manual_meeting = tokio::sync::RwLock::new(None);
+    let mut state = AudioProcessMeetingState::Idle;
+    let mut suppressed = Vec::new();
+    let mut flap_count = 0;
+    let in_meeting = AtomicBool::new(true);
+
+    let now = Instant::now();
+    let now_utc = Utc::now();
+    let started_at = now - Duration::from_secs(10 * 60);
+
+    apply_state_action(
+        AudioProcessStateAction::StartMeeting {
+            platform: "Google Meet".to_string(),
+            session_key: key.clone(),
+            meeting_url: Some("https://meet.google.com/abc-defg-hij".to_string()),
+            first_seen_at: started_at,
+            is_browser: true,
+            pid: process.pid,
+            bundle_id: process.bundle_id.clone(),
+        },
+        &db,
+        &manual_meeting,
+        &mut state,
+        &mut suppressed,
+        &mut flap_count,
+        &in_meeting,
+        &None,
+        None,
+        None,
+        &[],
+        started_at,
+        now_utc - chrono::Duration::minutes(10),
+    )
+    .await;
+    let meeting_id = match &state {
+        AudioProcessMeetingState::Active { meeting_id, .. } => *meeting_id,
+        other => panic!("expected an active meeting, got {other:?}"),
+    };
+
+    // The user stops recording explicitly while the detector's close is still
+    // pending. That write commits first and owns the stored boundary.
+    let manual_end = "2026-10-26T09:30:00.000Z";
+    db.end_meeting_with_typed_text(meeting_id, manual_end, true, None)
+        .await
+        .unwrap();
+
+    // The detector's retry lands afterwards, proposing its own boundary.
+    let since = now - ENDING_GRACE;
+    apply_state_action(
+        AudioProcessStateAction::EndMeeting {
+            meeting_id,
+            suppressed_session: Some(SuppressedSession {
+                session_key: key.clone(),
+                platform: Some("Google Meet".to_string()),
+                meeting_url: Some("https://meet.google.com/abc-defg-hij".to_string()),
+            }),
+            pending: pending_close_fixture(&key, started_at, since),
+        },
+        &db,
+        &manual_meeting,
+        &mut state,
+        &mut suppressed,
+        &mut flap_count,
+        &in_meeting,
+        &None,
+        None,
+        None,
+        &[],
+        now,
+        now_utc,
+    )
+    .await;
+
+    // `end_meeting_with_typed_text` reports the database-owned value, so the
+    // retry observes the explicit stop instead of overwriting it.
+    let stored_end = db
+        .get_meeting_by_id(meeting_id)
+        .await
+        .unwrap()
+        .meeting_end
+        .expect("the explicit stop closed the row");
+    assert_eq!(
+        chrono::DateTime::parse_from_rfc3339(&stored_end)
+            .unwrap()
+            .timestamp_millis(),
+        chrono::DateTime::parse_from_rfc3339(manual_end)
+            .unwrap()
+            .timestamp_millis(),
+        "an explicit stop owns the end; a later retry reports it, never moves it"
+    );
+    // The loop moves the state to `Idle` before dispatching the action, so a
+    // successful close leaves it alone. What matters is that it scheduled no
+    // retry: finding the row already ended is success, not a failure to repeat.
+    assert!(
+        !matches!(state, AudioProcessMeetingState::Ending { .. }),
+        "a close that finds the row already ended must not schedule a retry"
+    );
 }
