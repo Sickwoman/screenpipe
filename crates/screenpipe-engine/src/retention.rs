@@ -440,8 +440,8 @@ fn retention_cutoff(retention_days: u32, now: DateTime<Utc>) -> Option<DateTime<
 
 /// Remove a media file the DB has already marked evicted.
 ///
-/// The DB row is cleared inside `evict_media_in_range`'s transaction *before*
-/// we touch the disk, so a missing file here means the on-disk goal (file gone)
+/// The DB row is cleared inside the eviction transaction *before* we touch the
+/// disk, so a missing file here means the on-disk goal (file gone)
 /// is already met — usually because it was compacted away, deleted by a prior
 /// run, or the data dir was pruned by hand. Log that at debug, not warn, so the
 /// backend log isn't flooded with alarming "failed to evict" lines for a
@@ -453,6 +453,97 @@ async fn remove_evicted_file(path: &str) {
             debug!("retention: file already gone, nothing to evict: {}", path);
         }
         Err(e) => warn!("retention: failed to evict file {}: {}", path, e),
+    }
+}
+
+/// Why [`drain_media_before_cutoff`] stopped. Only `Done` means the cutoff was
+/// fully drained; the other two must leave the watermark where it was so the
+/// range is retried instead of being skipped forever.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DrainStop {
+    Done,
+    Suspended,
+    Failed,
+}
+
+/// Evicts every aged media file older than `cutoff` in bounded batches, until a
+/// batch evicts nothing.
+///
+/// Cutoff semantics rather than the window semantics retention used to get from
+/// `evict_media_in_range` (screenpipe/screenpipe#7770). The window form could
+/// never evict a VAD-`silent` audio chunk — it has no `audio_transcriptions`
+/// row to match on — and skipped any compacted video chunk straddling the
+/// one-hour window boundary, which the persisted watermark then moved past for
+/// good. Both modes reported `total_deleted: 0` forever while the disk grew.
+///
+/// Each batch is its own short transaction, so the single capture writer is
+/// never held across a whole backlog. Returns the rows evicted, whether
+/// anything was evicted at all, and why the drain stopped.
+async fn drain_media_before_cutoff(
+    db: &Arc<DatabaseManager>,
+    cutoff: DateTime<Utc>,
+) -> (u64, bool, DrainStop) {
+    let mut total: u64 = 0;
+    let mut any_deleted = false;
+
+    loop {
+        if screenpipe_core::background_work::is_suspended() {
+            info!(%cutoff, "retention: media eviction suspended; remaining media stays pending");
+            return (total, any_deleted, DrainStop::Suspended);
+        }
+
+        let result = match db
+            .evict_media_before_cutoff(cutoff, DatabaseManager::MEDIA_EVICT_BATCH_LIMIT)
+            .await
+        {
+            Ok(result) => result,
+            Err(e) => {
+                warn!(
+                    "retention: batch evict failed before cutoff {}: {}; range remains pending",
+                    cutoff, e
+                );
+                return (total, any_deleted, DrainStop::Failed);
+            }
+        };
+
+        let batch_total =
+            result.video_chunks_evicted + result.audio_chunks_evicted + result.snapshots_evicted;
+
+        for path in result
+            .video_files
+            .iter()
+            .chain(result.audio_files.iter())
+            .chain(result.snapshot_files.iter())
+        {
+            remove_evicted_file(path).await;
+        }
+
+        if batch_total == 0 {
+            // Nothing left under this cutoff. Return without sleeping: the
+            // caller's own per-window pacing still applies, and the empty
+            // probe opened no transaction at all.
+            return (total, any_deleted, DrainStop::Done);
+        }
+
+        any_deleted = true;
+        total += batch_total;
+
+        // Same prefix the issue reporter greps for to tell a working cycle
+        // from a no-op one. Keep it.
+        info!(
+            "retention: batch evicted video_chunks={} audio_chunks={} snapshots={} \
+             (files: video={} audio={} snapshots={})",
+            result.video_chunks_evicted,
+            result.audio_chunks_evicted,
+            result.snapshots_evicted,
+            result.video_files.len(),
+            result.audio_files.len(),
+            result.snapshot_files.len(),
+        );
+
+        // Bounded background work: hand the FIFO writer room between batches.
+        // Distinct from the caller's 500ms, which paces whole windows.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
 }
 
@@ -547,73 +638,21 @@ async fn do_local_cleanup(
                     }
                 }
             }
-            RetentionMode::Media => match db.evict_media_in_range(batch_start, batch_end).await {
-                Ok(result) => {
-                    let batch_total = result.video_chunks_evicted
-                        + result.audio_chunks_evicted
-                        + result.snapshots_evicted;
-
-                    if batch_total > 0 {
-                        any_deleted = true;
-                        info!(
-                            "retention: batch evicted video_chunks={} audio_chunks={} snapshots={} \
-                             (files: video={} audio={} snapshots={})",
-                            result.video_chunks_evicted,
-                            result.audio_chunks_evicted,
-                            result.snapshots_evicted,
-                            result.video_files.len(),
-                            result.audio_files.len(),
-                            result.snapshot_files.len(),
-                        );
-                    }
-
-                    total += batch_total;
-
-                    for path in result
-                        .video_files
-                        .iter()
-                        .chain(result.audio_files.iter())
-                        .chain(result.snapshot_files.iter())
-                    {
-                        remove_evicted_file(path).await;
-                    }
-                }
-                Err(e) => {
-                    warn!(
-                        "retention: batch evict failed for range {} to {}: {}",
-                        batch_start, batch_end, e
-                    );
+            RetentionMode::Media => {
+                let (evicted, any, stop) = drain_media_before_cutoff(db, batch_end).await;
+                total += evicted;
+                any_deleted |= any;
+                if !matches!(stop, DrainStop::Done) {
                     batch_failed = true;
                 }
-            },
+            }
             RetentionMode::Lean => {
                 // 1. Reclaim media files on disk (same as Media mode).
-                match db.evict_media_in_range(batch_start, batch_end).await {
-                    Ok(result) => {
-                        let evicted = result.video_chunks_evicted
-                            + result.audio_chunks_evicted
-                            + result.snapshots_evicted;
-                        if evicted > 0 {
-                            any_deleted = true;
-                        }
-                        total += evicted;
-
-                        for path in result
-                            .video_files
-                            .iter()
-                            .chain(result.audio_files.iter())
-                            .chain(result.snapshot_files.iter())
-                        {
-                            remove_evicted_file(path).await;
-                        }
-                    }
-                    Err(e) => {
-                        warn!(
-                            "retention: lean media evict failed for range {} to {}: {}",
-                            batch_start, batch_end, e
-                        );
-                        batch_failed = true;
-                    }
+                let (evicted, any, stop) = drain_media_before_cutoff(db, batch_end).await;
+                total += evicted;
+                any_deleted |= any;
+                if !matches!(stop, DrainStop::Done) {
+                    batch_failed = true;
                 }
 
                 // 2. Strip the heavy text rows (elements tree, AX JSON,
@@ -1297,5 +1336,190 @@ mod tests {
             "a failed batch must leave the watermark where it was so the next \
              cycle retries the same range, instead of silently skipping it forever"
         );
+    }
+
+    /// Seeds the exact shape from screenpipe/screenpipe#7770: a VAD-`silent`
+    /// audio chunk with no transcription row, and a compacted video chunk whose
+    /// frames straddle an hour boundary. Returns the two on-disk paths.
+    async fn seed_aged_unevictable_media(
+        db: &Arc<DatabaseManager>,
+        dir: &std::path::Path,
+    ) -> (std::path::PathBuf, std::path::PathBuf) {
+        let wav = dir.join("silent.wav");
+        let mp4 = dir.join("compacted.mp4");
+        std::fs::write(&wav, b"wav").unwrap();
+        std::fs::write(&mp4, b"mp4").unwrap();
+
+        let aged = Utc::now() - Duration::days(40);
+        db.execute_raw_sql_write(&format!(
+            "INSERT INTO audio_chunks (id, file_path, timestamp, transcription_status) \
+             VALUES (1, '{}', '{}', 'silent'); \
+             INSERT INTO video_chunks (id, file_path) VALUES (1, '{}'); \
+             INSERT INTO frames (id, video_chunk_id, offset_index, timestamp) \
+             VALUES (1, 1, 0, '{}'), (2, 1, 0, '{}');",
+            wav.display().to_string().replace('\\', "/"),
+            aged.to_rfc3339(),
+            mp4.display().to_string().replace('\\', "/"),
+            (aged - Duration::minutes(5)).to_rfc3339(),
+            (aged + Duration::minutes(5)).to_rfc3339(),
+        ))
+        .await
+        .unwrap();
+
+        // The paths we wrote above use forward slashes so the SQL literal is
+        // clean on Windows; hand back the real paths for existence checks.
+        (wav, mp4)
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(background_work)]
+    async fn media_retention_cycle_evicts_aged_media_and_reports_nonzero_total() {
+        let db = Arc::new(
+            DatabaseManager::new("sqlite::memory:", Default::default())
+                .await
+                .unwrap(),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let (wav, mp4) = seed_aged_unevictable_media(&db, dir.path()).await;
+
+        let now = Utc::now();
+        let (total, watermark) =
+            do_local_cleanup(&db, now - Duration::hours(2), now, RetentionMode::Media)
+                .await
+                .unwrap();
+
+        // Under the bug this was 0 forever — the `total_deleted: 0` the issue
+        // reports while the disk keeps growing.
+        assert!(
+            total >= 2,
+            "a Media cycle must evict the silent audio chunk and the straddling \
+             video chunk, got total={total}"
+        );
+        assert_eq!(watermark, now);
+        assert!(!wav.exists(), "silent wav must be reclaimed from disk");
+        assert!(!mp4.exists(), "compacted mp4 must be reclaimed from disk");
+
+        let marked: i64 = sqlx::query_scalar(
+            "SELECT (SELECT COUNT(*) FROM audio_chunks WHERE evicted_at IS NOT NULL AND file_path = '') \
+             + (SELECT COUNT(*) FROM video_chunks WHERE evicted_at IS NOT NULL AND file_path = '')",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(marked, 2, "both rows must be marked evicted");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(background_work)]
+    async fn media_retention_second_cycle_is_a_noop() {
+        let db = Arc::new(
+            DatabaseManager::new("sqlite::memory:", Default::default())
+                .await
+                .unwrap(),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        seed_aged_unevictable_media(&db, dir.path()).await;
+
+        let now = Utc::now();
+        let (first, watermark) =
+            do_local_cleanup(&db, now - Duration::hours(2), now, RetentionMode::Media)
+                .await
+                .unwrap();
+        assert!(first >= 2);
+
+        let (second, resumed) = do_local_cleanup(&db, watermark, now, RetentionMode::Media)
+            .await
+            .unwrap();
+        assert_eq!(second, 0, "nothing aged is left, so the cycle must evict 0");
+        assert_eq!(resumed, watermark);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(background_work)]
+    async fn media_retention_suspension_leaves_the_window_pending() {
+        struct RestoreSuspension(bool);
+        impl Drop for RestoreSuspension {
+            fn drop(&mut self) {
+                screenpipe_core::background_work::set_suspended(self.0);
+            }
+        }
+        let _restore = RestoreSuspension(false);
+
+        let db = Arc::new(
+            DatabaseManager::new("sqlite::memory:", Default::default())
+                .await
+                .unwrap(),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let (wav, mp4) = seed_aged_unevictable_media(&db, dir.path()).await;
+
+        screenpipe_core::background_work::set_suspended(true);
+
+        let now = Utc::now();
+        let start = now - Duration::hours(2);
+        let (total, watermark) = do_local_cleanup(&db, start, now, RetentionMode::Media)
+            .await
+            .unwrap();
+
+        assert_eq!(total, 0);
+        assert_eq!(
+            watermark, start,
+            "a suspended drain must leave the range pending, not skip it"
+        );
+        assert!(wav.exists(), "suspended retention must not touch media");
+        assert!(mp4.exists());
+
+        screenpipe_core::background_work::set_suspended(false);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(background_work)]
+    async fn lean_retention_evicts_media_and_still_strips_heavy_text() {
+        let db = Arc::new(
+            DatabaseManager::new("sqlite::memory:", Default::default())
+                .await
+                .unwrap(),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let (wav, mp4) = seed_aged_unevictable_media(&db, dir.path()).await;
+
+        let now = Utc::now();
+        let start = now - Duration::hours(2);
+
+        // An in-window frame carrying the heavy element tree Lean mode strips.
+        db.execute_raw_sql_write(&format!(
+            "INSERT INTO frames (id, offset_index, timestamp, full_text) \
+             VALUES (99, 0, '{}', 'keep me searchable'); \
+             INSERT INTO elements (id, frame_id, source, role, text) \
+             VALUES (1, 99, 'accessibility', 'AXText', 'heavy tree');",
+            (now - Duration::minutes(90)).to_rfc3339(),
+        ))
+        .await
+        .unwrap();
+
+        let (total, watermark) = do_local_cleanup(&db, start, now, RetentionMode::Lean)
+            .await
+            .unwrap();
+
+        assert_eq!(watermark, now);
+        assert!(total >= 3, "media eviction plus text strip, got {total}");
+
+        // Half 1: media reclaimed by the cutoff drain.
+        assert!(!wav.exists());
+        assert!(!mp4.exists());
+
+        // Half 2: the hour-window text strip still ran.
+        let elements: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM elements")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(elements, 0, "Lean must still strip the element tree");
+        let searchable: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM frames WHERE id = 99 AND full_text IS NOT NULL",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(searchable, 1, "Lean keeps full_text searchable");
     }
 }

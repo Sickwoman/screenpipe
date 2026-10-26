@@ -1085,4 +1085,161 @@ mod query_plan_tests {
         assert_uses_index(&plan, "audio_dedup");
         assert_no_table_scan(&plan, "audio_dedup");
     }
+
+    // ──────────────────────────────────────────────────────────
+    // Retention media eviction by cutoff (screenpipe/screenpipe#7770).
+    // These queries run every retention cycle on the read pool, so a scan of
+    // frames/audio_chunks here would be paid on every user's machine forever.
+    // ──────────────────────────────────────────────────────────
+
+    /// Seed a mature-looking audio table: mostly aged+evicted, a live tail.
+    async fn seed_audio_chunks(db: &DatabaseManager, count: usize) {
+        let aged = Utc::now() - Duration::days(40);
+        for i in 0..count {
+            let ts = aged + Duration::seconds(i as i64);
+            sqlx::query(
+                "INSERT INTO audio_chunks (file_path, timestamp, transcription_status) \
+                 VALUES (?1, ?2, 'silent')",
+            )
+            .bind(format!("/data/a_{i}.wav"))
+            .bind(ts.to_rfc3339())
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn media_eviction_audio_candidates_use_timestamp_index() {
+        let db = setup_test_db().await;
+        seed_audio_chunks(&db, 500).await;
+
+        // Verbatim candidate query from evict_media_before_cutoff.
+        let plan = explain(
+            &db,
+            r#"SELECT id, file_path
+               FROM audio_chunks
+               WHERE evicted_at IS NULL
+               AND file_path != ''
+               AND file_path NOT LIKE 'cloud://%'
+               AND timestamp < '2030-01-01T00:00:00'
+               AND julianday(timestamp) < julianday('2030-01-01T00:00:00+00:00')
+               AND +transcription_status IN ('transcribed', 'silent')
+               AND NOT EXISTS (SELECT 1 FROM audio_transcriptions t
+                               WHERE t.audio_chunk_id = audio_chunks.id
+                               AND julianday(t.timestamp) >= julianday('2030-01-01T00:00:00+00:00'))
+               ORDER BY timestamp ASC
+               LIMIT 256"#,
+        )
+        .await;
+        println!("audio candidates plan:\n{}", plan.join("\n"));
+
+        assert_no_table_scan(&plan, "media_eviction_audio_candidates");
+        assert!(
+            plan.iter()
+                .any(|l| l.contains("idx_audio_chunks_timestamp")),
+            "the aged-audio candidate query must ride idx_audio_chunks_timestamp so the \
+             range bound and the ORDER BY are both satisfied by the index. The unary `+` \
+             on transcription_status is what keeps the planner off the two-value \
+             idx_audio_chunks_status; if it was dropped, put it back.\nPlan:\n{}",
+            plan.join("\n")
+        );
+        assert!(
+            !plan.iter().any(|l| l.contains("TEMP B-TREE")),
+            "ORDER BY timestamp must be satisfied by the index, not a sort of every \
+             matching row.\nPlan:\n{}",
+            plan.join("\n")
+        );
+        // The correlated transcription probe must be an index lookup.
+        assert!(
+            plan.iter()
+                .any(|l| l.contains("SEARCH t")
+                    && l.contains("idx_audio_transcriptions_audio_chunk_id")),
+            "the NOT EXISTS probe must use idx_audio_transcriptions_audio_chunk_id.\nPlan:\n{}",
+            plan.join("\n")
+        );
+    }
+
+    #[tokio::test]
+    async fn media_eviction_video_candidates_probe_frames_by_chunk() {
+        let db = setup_test_db().await;
+        seed_data(&db, 500).await;
+
+        let plan = explain(
+            &db,
+            r#"SELECT vc.id, vc.file_path
+               FROM video_chunks vc
+               WHERE vc.evicted_at IS NULL
+               AND vc.file_path != ''
+               AND vc.file_path NOT LIKE 'cloud://%'
+               AND EXISTS (SELECT 1 FROM frames f WHERE f.video_chunk_id = vc.id)
+               AND NOT EXISTS (SELECT 1 FROM frames f
+                               WHERE f.video_chunk_id = vc.id
+                               AND julianday(f.timestamp) >= julianday('2030-01-01T00:00:00+00:00'))
+               ORDER BY vc.id
+               LIMIT 256"#,
+        )
+        .await;
+        println!("video candidates plan:\n{}", plan.join("\n"));
+
+        // The point of the correlated form: each candidate probes frames by
+        // chunk id instead of grouping the whole frames table per call.
+        assert!(
+            plan.iter()
+                .any(|l| l.contains("SEARCH f") && l.contains("idx_frames_video_chunk_id")),
+            "frames must be probed by video_chunk_id, never scanned.\nPlan:\n{}",
+            plan.join("\n")
+        );
+        assert!(
+            !plan.iter().any(|l| l.contains("SCAN f")),
+            "a scan of frames per candidate chunk would be O(chunks x frames).\nPlan:\n{}",
+            plan.join("\n")
+        );
+    }
+
+    #[tokio::test]
+    async fn media_eviction_snapshot_candidates_use_partial_index() {
+        let db = setup_test_db().await;
+        seed_data(&db, 500).await;
+
+        // Mature DB: most frames already compacted to NULL snapshot_path.
+        sqlx::query("UPDATE frames SET snapshot_path = NULL")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE frames SET snapshot_path = '/tmp/f_' || id || '.jpg' \
+             WHERE id IN (SELECT id FROM frames ORDER BY id DESC LIMIT 20)",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        let plan = explain(
+            &db,
+            r#"SELECT id, snapshot_path
+               FROM frames
+               WHERE snapshot_path IS NOT NULL
+               AND snapshot_path NOT LIKE 'cloud://%'
+               AND timestamp < '2030-01-01T00:00:00'
+               AND julianday(timestamp) < julianday('2030-01-01T00:00:00+00:00')
+               ORDER BY device_name, timestamp ASC
+               LIMIT 256"#,
+        )
+        .await;
+        println!("snapshot candidates plan:\n{}", plan.join("\n"));
+
+        assert_no_table_scan(&plan, "media_eviction_snapshot_candidates");
+        assert!(
+            plan.iter()
+                .any(|l| l.contains("idx_frames_snapshot_pending")),
+            "must ride the tiny partial index, same as snapshot compaction.\nPlan:\n{}",
+            plan.join("\n")
+        );
+        assert!(
+            !plan.iter().any(|l| l.contains("TEMP B-TREE")),
+            "the (device_name, timestamp) index key order satisfies ORDER BY.\nPlan:\n{}",
+            plan.join("\n")
+        );
+    }
 }

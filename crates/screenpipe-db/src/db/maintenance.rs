@@ -58,7 +58,79 @@ async fn run_guarded_routine_wal_checkpoint(
     run_routine_wal_checkpoint(pool).await.map(Some)
 }
 
+const MARK_VIDEO_EVICTED: &str = "UPDATE video_chunks \
+     SET file_path = '', evicted_at = CURRENT_TIMESTAMP \
+     WHERE evicted_at IS NULL AND file_path != '' \
+     AND file_path NOT LIKE 'cloud://%' AND id IN (";
+
+const MARK_AUDIO_EVICTED: &str = "UPDATE audio_chunks \
+     SET file_path = '', evicted_at = CURRENT_TIMESTAMP \
+     WHERE evicted_at IS NULL AND file_path != '' \
+     AND file_path NOT LIKE 'cloud://%' AND id IN (";
+
+const MARK_SNAPSHOT_EVICTED: &str = "UPDATE frames \
+     SET snapshot_path = NULL \
+     WHERE snapshot_path IS NOT NULL AND id IN (";
+
+fn ids_of(candidates: &[(i64, String)]) -> Vec<i64> {
+    candidates.iter().map(|(id, _)| *id).collect()
+}
+
+/// Keeps the reported file list and the rows actually marked identical: only
+/// paths whose row the UPDATE reported back are returned for unlinking.
+///
+/// An id the UPDATE does *not* report (a concurrent `POST /data/evict-media`,
+/// or a compaction that cleared `file_path` in between) is deliberately left
+/// out — whoever flipped that row owns its file, so there is no double delete.
+fn files_for(candidates: &[(i64, String)], marked: &[i64]) -> Vec<String> {
+    let marked: std::collections::HashSet<i64> = marked.iter().copied().collect();
+    candidates
+        .iter()
+        .filter(|(id, _)| marked.contains(id))
+        .map(|(_, path)| path.clone())
+        .collect()
+}
+
+/// Marks exactly the listed ids and returns the ids the UPDATE really changed.
+///
+/// Binding the id list is the whole point of this helper. Re-running the
+/// LIMIT-ed selection *predicate* as an UPDATE instead would mark more rows
+/// than the returned file list holds, leaving media on disk with no row
+/// pointing at it — or, with the opposite skew, reporting files whose rows were
+/// never marked, so they get re-selected forever (the screenpipe#4843
+/// symptom). The ids come from a read microseconds earlier, so the two sets are
+/// identical by construction.
+async fn mark_media_evicted(
+    conn: &mut sqlx::SqliteConnection,
+    prefix: &'static str,
+    ids: &[i64],
+) -> Result<Vec<i64>, sqlx::Error> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    debug_assert!(ids.len() as i64 <= DatabaseManager::MEDIA_EVICT_BATCH_LIMIT);
+
+    let mut builder = sqlx::QueryBuilder::<sqlx::Sqlite>::new(prefix);
+    {
+        let mut list = builder.separated(", ");
+        for id in ids {
+            list.push_bind(*id);
+        }
+    }
+    builder.push(") RETURNING id");
+    builder.build_query_scalar::<i64>().fetch_all(conn).await
+}
+
 impl DatabaseManager {
+    /// Maximum rows per table per [`Self::evict_media_before_cutoff`] batch.
+    ///
+    /// One `UPDATE ... WHERE id IN (...)` per table per batch, so this also
+    /// caps the bound-parameter count. 256 mirrors
+    /// `SEMANTIC_ATTACH_FRAME_CHUNK` and stays far below SQLite's limit, which
+    /// means no inner chunking loop is needed and the write transaction holding
+    /// the capture writer stays short.
+    pub const MEDIA_EVICT_BATCH_LIMIT: i64 = 256;
+
     /// Execute trusted, row-returning dynamic SQL on the query pool.
     pub async fn query_raw_sql(&self, query: &str) -> Result<serde_json::Value, sqlx::Error> {
         if self.release_owner.is_some() {
@@ -705,6 +777,234 @@ impl DatabaseManager {
             video_chunks_evicted: video_evict.rows_affected(),
             audio_chunks_evicted: audio_evict.rows_affected(),
             snapshots_evicted: snapshot_evict.rows_affected(),
+            video_files,
+            audio_files,
+            snapshot_files,
+        })
+    }
+
+    /// Retention-only media eviction by **cutoff** ("everything older than
+    /// `cutoff`"), as opposed to [`Self::evict_media_in_range`]'s `[start, end]`
+    /// **window** semantics, which stays exactly as it is because
+    /// `POST /data/evict-media` and the storage preview
+    /// ([`Self::estimate_evictable_bytes`]) depend on it
+    /// (screenpipe/screenpipe#7770).
+    ///
+    /// Two leaks the window form has and this one does not:
+    ///
+    /// 1. **Silent audio was unevictable.** There, audio eligibility requires a
+    ///    row in `audio_transcriptions`. A VAD-`silent` chunk never gets one
+    ///    (`ChunkOutcome::Silent` marks the status and writes no transcription),
+    ///    and neither does `ChunkOutcome::Duplicate`. On the reporting machine
+    ///    that was 100% of aged audio — 1.59 GB retained past a 30-day policy,
+    ///    with 10.9 GB more queued behind it.
+    /// 2. **Compacted video chunks were skipped forever.** There, a chunk is
+    ///    evicted only when *every* one of its frames falls inside the window.
+    ///    Retention walks fixed one-hour windows and persists a watermark past
+    ///    each one, so a post-compaction chunk spanning 10-20 minutes straddles
+    ///    the boundary, is skipped, and is never revisited.
+    ///
+    /// Note also what is *absent* rather than fixed: there is no
+    /// `NOT IN (subquery)` anti-join here, so the `x NOT IN (set containing
+    /// NULL)` three-valued-logic trap (screenpipe/screenpipe#4843) cannot
+    /// occur. Video uses a correlated `NOT EXISTS (... WHERE f.video_chunk_id =
+    /// vc.id ...)`; a NULL `video_chunk_id` never satisfies that equality, so
+    /// NULL rows structurally cannot enter the comparison.
+    ///
+    /// Bounded by `limit` (clamped to `1..=MEDIA_EVICT_BATCH_LIMIT`) so the
+    /// IMMEDIATE transaction stays short. Call it repeatedly until a call
+    /// evicts nothing; retention does exactly that.
+    ///
+    /// Hot path: candidate selection runs on the read pool *before* the writer
+    /// is acquired, because `begin_immediate_with_retry` holds the single
+    /// process-wide write semaphore for the whole transaction — the capture
+    /// writer's lane. `next_retention_timestamp` states the same rule: "Select
+    /// metadata before acquiring the writer; an hour can contain enough
+    /// archived elements to hold that writer past the capture request's own
+    /// deadline." When there is nothing to evict this opens no transaction at
+    /// all, which is the steady state once a backlog has drained.
+    pub async fn evict_media_before_cutoff(
+        &self,
+        cutoff: DateTime<Utc>,
+        limit: i64,
+    ) -> Result<EvictMediaResult, sqlx::Error> {
+        let limit = limit.clamp(1, Self::MEDIA_EVICT_BATCH_LIMIT);
+
+        // Two bindings per comparison, following `next_retention_timestamp`:
+        // `scan_upper` is an index-friendly string bound that keeps the range
+        // search on idx_audio_chunks_timestamp / idx_frames_timestamp, and
+        // `julianday()` decides the actual instant.
+        //
+        // This is spelling-safe in the one direction that matters. Rows are
+        // written by binding a chrono `DateTime<Utc>` (see `write_queue`),
+        // while the bound here is RFC3339 text, and SQLite compares the two as
+        // strings. Because `scan_upper` is only ever an *upper* bound, and
+        // ' ' (0x20) sorts before 'T' (0x54), a space-separated spelling can
+        // only ever compare lower than this bound — it can be wrongly
+        // *included*, never wrongly excluded, and `julianday()` then rejects
+        // it. A `>=` lower bound would not have that property, which is the
+        // hazard the window form carries and the cutoff form does not have at
+        // all. `audio_chunk_timestamp_spelling_test` pins the stored spelling.
+        let cutoff_rfc = cutoff.to_rfc3339();
+        let scan_upper = cutoff
+            .checked_add_signed(chrono::Duration::seconds(1))
+            .unwrap_or(cutoff)
+            .format("%Y-%m-%dT%H:%M:%S")
+            .to_string();
+
+        // Video first, deliberately: retention's
+        // `do_local_cleanup_failed_batch_does_not_advance_watermark_past_it`
+        // drops `video_chunks` and relies on the first batch surfacing the
+        // error so the watermark does not advance past a failed range.
+        //
+        // A chunk is eligible when its NEWEST frame is older than the cutoff.
+        // `video_chunks` carries no timestamp column, so eligibility has to go
+        // through `frames`; the correlated form probes
+        // idx_frames_video_chunk_id_timestamp per candidate instead of grouping
+        // the whole frames table on every call. Same intent as
+        // `get_unuploaded_video_chunks`' `GROUP BY ... HAVING MAX(...) < ?1`.
+        let video_candidates: Vec<(i64, String)> = sqlx::query_as(
+            r#"SELECT vc.id, vc.file_path
+               FROM video_chunks vc
+               WHERE vc.evicted_at IS NULL
+               AND vc.file_path != ''
+               AND vc.file_path NOT LIKE 'cloud://%'
+               AND EXISTS (SELECT 1 FROM frames f WHERE f.video_chunk_id = vc.id)
+               AND NOT EXISTS (SELECT 1 FROM frames f
+                               WHERE f.video_chunk_id = vc.id
+                               AND julianday(f.timestamp) >= julianday(?1))
+               ORDER BY vc.id
+               LIMIT ?2"#,
+        )
+        .bind(&cutoff_rfc)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        // Aged chunks in a FINAL processing state, including `silent` ones that
+        // have no transcription row at all — the actual fix.
+        //
+        // `pending` and `failed` are excluded so a retry still has its wav, and
+        // so does a user-requested retranscription (which resets the status to
+        // `pending`). The `IN` list is NULL-rejecting, which is the behavior we
+        // want defensively: `transcription_status` is `TEXT NOT NULL DEFAULT
+        // 'pending'` and the ALTER TABLE backfilled every legacy row, so NULL
+        // is unreachable here, but if one ever appeared through schema surgery,
+        // "unknown processing state" must mean "keep the file". Evicting a wav
+        // that a retry still needs is unrecoverable; leaking a few ancient wavs
+        // is not.
+        //
+        // The unary `+` on `transcription_status` is load-bearing, not noise.
+        // Without it SQLite picks `idx_audio_chunks_status` — a two-value index
+        // — which means scanning every `silent`/`transcribed` row and then
+        // sorting all of them to satisfy the ORDER BY ("USE TEMP B-TREE FOR
+        // ORDER BY"), on every retention cycle. `+` makes that one term
+        // non-indexable, so the planner uses `idx_audio_chunks_timestamp`
+        // instead, which serves both the range bound and the ordering.
+        // `query_plan_test::media_eviction_audio_candidates_use_timestamp_index`
+        // fails if this regresses.
+        let audio_candidates: Vec<(i64, String)> = sqlx::query_as(
+            r#"SELECT id, file_path
+               FROM audio_chunks
+               WHERE evicted_at IS NULL
+               AND file_path != ''
+               AND file_path NOT LIKE 'cloud://%'
+               AND timestamp < ?1
+               AND julianday(timestamp) < julianday(?2)
+               AND +transcription_status IN ('transcribed', 'silent')
+               AND NOT EXISTS (SELECT 1 FROM audio_transcriptions t
+                               WHERE t.audio_chunk_id = audio_chunks.id
+                               AND julianday(t.timestamp) >= julianday(?2))
+               ORDER BY timestamp ASC
+               LIMIT ?3"#,
+        )
+        .bind(&scan_upper)
+        .bind(&cutoff_rfc)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        // Snapshot JPEGs are per-frame, not chunked. The `cloud://` guard is
+        // new relative to the window form: such a path is the only pointer to a
+        // remote blob and frees zero local bytes, so nulling it would be pure
+        // data loss. ORDER BY matches idx_frames_snapshot_pending(device_name,
+        // timestamp) so the plan stays a partial-index scan with no temp
+        // b-tree — see query_plan_test.
+        let snapshot_candidates: Vec<(i64, String)> = sqlx::query_as(
+            r#"SELECT id, snapshot_path
+               FROM frames
+               WHERE snapshot_path IS NOT NULL
+               AND snapshot_path NOT LIKE 'cloud://%'
+               AND timestamp < ?1
+               AND julianday(timestamp) < julianday(?2)
+               ORDER BY device_name, timestamp ASC
+               LIMIT ?3"#,
+        )
+        .bind(&scan_upper)
+        .bind(&cutoff_rfc)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        if video_candidates.is_empty()
+            && audio_candidates.is_empty()
+            && snapshot_candidates.is_empty()
+        {
+            return Ok(EvictMediaResult {
+                video_chunks_evicted: 0,
+                audio_chunks_evicted: 0,
+                snapshots_evicted: 0,
+                video_files: Vec::new(),
+                audio_files: Vec::new(),
+                snapshot_files: Vec::new(),
+            });
+        }
+
+        let mut tx = self.begin_immediate_with_retry().await?;
+
+        let video_marked = mark_media_evicted(
+            &mut **tx.conn(),
+            MARK_VIDEO_EVICTED,
+            &ids_of(&video_candidates),
+        )
+        .await?;
+        let audio_marked = mark_media_evicted(
+            &mut **tx.conn(),
+            MARK_AUDIO_EVICTED,
+            &ids_of(&audio_candidates),
+        )
+        .await?;
+        let snapshot_marked = mark_media_evicted(
+            &mut **tx.conn(),
+            MARK_SNAPSHOT_EVICTED,
+            &ids_of(&snapshot_candidates),
+        )
+        .await?;
+
+        tx.commit().await.map_err(|e| {
+            error!(
+                "failed to commit evict_media_before_cutoff transaction: {}",
+                e
+            );
+            e
+        })?;
+
+        let video_files = files_for(&video_candidates, &video_marked);
+        let audio_files = files_for(&audio_candidates, &audio_marked);
+        let snapshot_files = files_for(&snapshot_candidates, &snapshot_marked);
+
+        debug!(
+            "evict_media_before_cutoff committed: cutoff={}, video_chunks={}, audio_chunks={}, snapshots={}",
+            cutoff_rfc,
+            video_files.len(),
+            audio_files.len(),
+            snapshot_files.len(),
+        );
+
+        Ok(EvictMediaResult {
+            video_chunks_evicted: video_files.len() as u64,
+            audio_chunks_evicted: audio_files.len() as u64,
+            snapshots_evicted: snapshot_files.len() as u64,
             video_files,
             audio_files,
             snapshot_files,
@@ -1786,8 +2086,8 @@ mod wal_maintenance_tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    // Keep the two large latency fixtures from competing with each other;
-    // each still queues a real capture concurrently with its cleanup.
+    // Keep the large latency fixtures from competing with each other; each
+    // still queues a real capture concurrently with its cleanup.
     static LARGE_RETENTION_FIXTURE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     #[tokio::test]
@@ -2470,6 +2770,159 @@ mod wal_maintenance_tests {
         .await
         .unwrap();
         assert_eq!(count, 65, "captures must survive close and reopen");
+        let integrity: String = sqlx::query_scalar("PRAGMA integrity_check")
+            .fetch_one(&reopened.pool)
+            .await
+            .unwrap();
+        assert_eq!(integrity, "ok");
+        reopened.close().await;
+    }
+
+    /// Hot-path proof for `evict_media_before_cutoff`
+    /// (screenpipe/screenpipe#7770): draining a large aged-media backlog must
+    /// not stall capture.
+    ///
+    /// Two structural reasons it cannot, both asserted here end to end: the
+    /// candidate selection runs on the read pool *before*
+    /// `begin_immediate_with_retry` takes the single write semaphore, and each
+    /// batch marks at most `MEDIA_EVICT_BATCH_LIMIT` rows by rowid. Run with a
+    /// `write_pool_max: 1` database so there is exactly one writer lane to
+    /// contend for, and hold every capture to the 15-second deadline the
+    /// Windows event-driven capture caller already imposes.
+    #[tokio::test]
+    async fn media_eviction_batch_keeps_capture_durable() {
+        // Third large latency fixture in this module, so it takes the same
+        // lock: it saturates the single writer lane on purpose, and running
+        // concurrently with the other two starves them past their deadlines.
+        let _fixture = LARGE_RETENTION_FIXTURE.lock().await;
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("db.sqlite");
+        let db_path_string = path.to_str().unwrap().to_string();
+        let config = DbConfig {
+            write_pool_max: 1,
+            ..Default::default()
+        };
+        let db = Arc::new(
+            DatabaseManager::new(&db_path_string, config.clone())
+                .await
+                .unwrap(),
+        );
+
+        // A backlog the window form could never have touched: 5 000 aged
+        // silent audio chunks with no transcription rows, plus 2 000 aged
+        // snapshot frames. Many batches per table (the limit is 256), and the
+        // whole drain still completes in well under a second.
+        db.execute_raw_sql_write(
+            "WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<5000) \
+             INSERT INTO audio_chunks(id,file_path,timestamp,transcription_status) \
+             SELECT i,'/data/aged_'||i||'.wav', \
+             strftime('%Y-%m-%dT%H:%M:%S+00:00','2026-01-01T00:00:00Z',(i||' seconds')),'silent' \
+             FROM n;",
+        )
+        .await
+        .unwrap();
+        db.execute_raw_sql_write(
+            "WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<2000) \
+             INSERT INTO frames(id,offset_index,timestamp,snapshot_path) \
+             SELECT i,0, \
+             strftime('%Y-%m-%dT%H:%M:%S+00:00','2026-01-01T00:00:00Z',(i||' seconds')), \
+             '/data/aged_'||i||'.jpg' FROM n;",
+        )
+        .await
+        .unwrap();
+
+        let cutoff: chrono::DateTime<chrono::Utc> = "2026-06-01T00:00:00Z".parse().unwrap();
+
+        // Drain in the background exactly the way retention does.
+        let drain_db = Arc::clone(&db);
+        let drain = tokio::spawn(async move {
+            let mut drained: u64 = 0;
+            loop {
+                let result = drain_db
+                    .evict_media_before_cutoff(cutoff, DatabaseManager::MEDIA_EVICT_BATCH_LIMIT)
+                    .await
+                    .unwrap();
+                let batch = result.video_chunks_evicted
+                    + result.audio_chunks_evicted
+                    + result.snapshots_evicted;
+                if batch == 0 {
+                    return drained;
+                }
+                drained += batch;
+            }
+        });
+
+        // Captures must keep landing throughout, each inside the 15s budget.
+        let mut longest = Duration::from_millis(0);
+        let mut accepted = 0u32;
+        while !drain.is_finished() {
+            let started = std::time::Instant::now();
+            let capture = tokio::time::timeout(
+                Duration::from_secs(15),
+                db.insert_snapshot_frame(
+                    "live-test",
+                    chrono::Utc::now(),
+                    "",
+                    None,
+                    None,
+                    None,
+                    true,
+                    None,
+                    Some("durable capture during media eviction"),
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+            )
+            .await;
+            let elapsed = started.elapsed();
+            longest = longest.max(elapsed);
+            capture
+                .expect("capture must not exceed the 15s deadline during media eviction")
+                .expect("capture must persist during media eviction");
+            accepted += 1;
+        }
+
+        let drained = drain.await.unwrap();
+        println!(
+            "media eviction: drained={drained} rows, captures accepted={accepted}, \
+             longest capture={longest:?} (deadline 15s)"
+        );
+        assert_eq!(drained, 7000, "the whole aged backlog must be reclaimed");
+        assert!(
+            accepted > 0,
+            "at least one capture must be accepted during the drain"
+        );
+        assert!(
+            longest < Duration::from_secs(15),
+            "capture latency {longest:?} must stay inside the capture deadline"
+        );
+
+        // Nothing aged survives, and the live captures do.
+        let remaining: i64 = sqlx::query_scalar(
+            "SELECT (SELECT COUNT(*) FROM audio_chunks WHERE evicted_at IS NULL) \
+             + (SELECT COUNT(*) FROM frames WHERE snapshot_path IS NOT NULL \
+                AND timestamp < '2026-06-01T00:00:00+00:00')",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(remaining, 0, "no aged media may be left behind");
+
+        db.verify_storage().await.unwrap();
+        db.close().await;
+
+        let reopened = DatabaseManager::new(&db_path_string, config).await.unwrap();
+        let survived: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM frames WHERE device_name = 'live-test'")
+                .fetch_one(&reopened.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            survived, accepted as i64,
+            "every accepted capture must survive close and reopen"
+        );
         let integrity: String = sqlx::query_scalar("PRAGMA integrity_check")
             .fetch_one(&reopened.pool)
             .await
